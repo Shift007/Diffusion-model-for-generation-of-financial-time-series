@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 
 
@@ -71,12 +72,26 @@ class Diffusion:
             loss = F.mse_loss(predicted_noise, noise, reduction='none')
             loss = loss * weights
         elif loss_type == 'tail_focused':  # NUOVO - focus sulle tails
-            loss = F.mse_loss(predicted_noise, noise, reduction='none')
+            loss = F.smooth_l1_loss(predicted_noise, noise, reduction='none')
             # Peso esponenziale per valori estremi
             threshold = 1.5  # Soglia per considerare "tail"
             tail_mask = (torch.abs(x_start) > threshold).float()
             tail_weight = 3.0  # Peso 3x per le tails
             weights = 1.0 + tail_mask * (tail_weight - 1.0)
+            loss = loss * weights
+        elif loss_type == 'frequency_weighted':
+            # Weighted loss for wavelet coefficients
+            # Penalize errors in approximation coefficients (Level 0) more heavily
+            loss = F.smooth_l1_loss(predicted_noise, noise, reduction='none')
+            
+            # Create weight mask
+            # Shape: (B, C, H, W) where H is frequency levels
+            weights = torch.ones_like(loss)
+            
+            # Apply 3x weight to approximation coefficients (index 0 along H dimension)
+            # A factor of 3.0 gives incentive to fix the trend without overpowering fine details
+            weights[:, :, 0, :] = 2.0
+            
             loss = loss * weights
         
         return loss.mean()
@@ -108,9 +123,51 @@ class Diffusion:
     def sample(self, shape, temperature=1.5):
         """Sample with temperature control for diversity"""
         x = torch.randn(shape, device=self.device)
-        for i in reversed(range(self.timesteps)):
+        for i in tqdm(reversed(range(self.timesteps)), desc="Sampling", total=self.timesteps):
             x = self.p_sample(x, i, temperature=temperature)
         return x
+
+    @torch.no_grad()
+    def ddim_sample(self, shape, steps=50, eta=0.0):
+        """
+        DDIM sampling for faster generation.
+        steps: number of steps to take (e.g. 50 instead of 1500)
+        eta: 0.0 for deterministic (DDIM), 1.0 for DDPM-like
+        """
+        batch_size = shape[0]
+        device = self.device
+        
+        # Generate time sequence (e.g. [1499, ..., 0])
+        # We want to go from T-1 down to 0
+        times = torch.linspace(0, self.timesteps - 1, steps=steps + 1).long().to(device)
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:])) # (t, t_prev)
+        
+        img = torch.randn(shape, device=device)
+        
+        for t, t_prev in tqdm(time_pairs, desc=f"DDIM Sampling ({steps} steps)"):
+            # 1. Predict noise
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            pred_noise = self.model(img, t_tensor)
+            
+            # 2. Get alpha values
+            alpha_cumprod_t = self.alpha_cumprod[t]
+            alpha_cumprod_t_prev = self.alpha_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)
+            
+            # 3. Compute predicted x0
+            pred_x0 = (img - torch.sqrt(1 - alpha_cumprod_t) * pred_noise) / torch.sqrt(alpha_cumprod_t)
+            pred_x0 = torch.clamp(pred_x0, -1., 1.) # Clip to valid range
+            
+            # 4. Compute direction pointing to x_t
+            sigma_t = eta * torch.sqrt((1 - alpha_cumprod_t_prev) / (1 - alpha_cumprod_t) * (1 - alpha_cumprod_t / alpha_cumprod_t_prev))
+            
+            # 5. Compute x_{t-1}
+            dir_xt = torch.sqrt(1 - alpha_cumprod_t_prev - sigma_t**2) * pred_noise
+            noise = torch.randn_like(img) if sigma_t > 0 else 0.
+            
+            img = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + dir_xt + sigma_t * noise
+            
+        return img
 
 
 def sample_loop(model, image_size, channels=1, timesteps=1000, device='cpu', batch_size=8):
