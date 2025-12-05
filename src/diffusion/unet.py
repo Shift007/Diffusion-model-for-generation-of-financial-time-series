@@ -90,15 +90,15 @@ class UNet(nn.Module):
 
         # Down stages
         self.downs = nn.ModuleList([])
-        dims = [base_ch, base_ch*2, base_ch*4]
+        dims = [base_ch, base_ch*2, base_ch*4, base_ch*8]
         for i in range(len(dims)-1):
             dim_in = dims[i]
             dim_out = dims[i+1]
             self.downs.append(nn.ModuleList([
                 ResnetBlock(dim_in, dim_in, time_emb_dim),
                 ResnetBlock(dim_in, dim_in, time_emb_dim),
-                # Downsample only time dimension (stride=(1, 2)) to preserve frequency resolution (9 levels)
-                nn.Conv2d(dim_in, dim_out, 3, stride=(1, 2), padding=1) 
+                # Downsample both time and frequency dimensions (stride=(2, 2))
+                nn.Conv2d(dim_in, dim_out, 3, stride=(2, 2), padding=1) 
             ]))
 
         # Middle stage
@@ -114,8 +114,8 @@ class UNet(nn.Module):
             dim_in = reversed_dims[i]
             dim_out = reversed_dims[i+1]
             self.ups.append(nn.ModuleList([
-                # Upsample only time dimension
-                nn.ConvTranspose2d(dim_in, dim_out, 3, stride=(1, 2), padding=1, output_padding=(0, 1)), 
+                # Upsample both time and frequency dimensions
+                nn.ConvTranspose2d(dim_in, dim_out, 3, stride=(2, 2), padding=1, output_padding=(0, 1)), 
                 ResnetBlock(dim_out * 2, dim_out, time_emb_dim), # *2 for skip connection
                 ResnetBlock(dim_out, dim_out, time_emb_dim)
             ]))
